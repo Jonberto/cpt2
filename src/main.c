@@ -4,7 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
-
+#include <stdbool.h>
 #define safetensors_file_size 548105171
 #define params_raw_size 548090880 // saftensors_file_size - json_raw_size - 8
 #define d_vocab  50257
@@ -15,7 +15,9 @@
 #define json_raw_size 14283
 #define d_model 768
 #define d_seq 1024
-
+#define d_k 64
+#define inv_sqrt_k 0.125f
+#define n_layers 12
 
 
 struct token {
@@ -90,8 +92,157 @@ struct activations {
         struct{
             float out[d_seq][d_model];
         } ln_1;
+        struct {
+            struct {
+                float out[d_seq][3 * d_model];
+            } c_attn;
+            struct {
+                float out[12][d_seq][d_seq];
+            } attn;
+            struct {
+                float out[12][d_seq][d_seq];
+            } s;
+            struct {
+                float out[d_seq][d_model];
+            } z; 
+            struct {
+                float out[d_seq][d_model];
+            } c_proj;           
+        } attn;
+        struct {
+            float out[d_seq][d_model];
+        } res_1;
+        struct {
+            float out[d_seq][d_model];
+        } ln_2;
+        struct {
+            struct {
+                float out[d_seq][4 * d_model];
+            } c_fc;
+            struct {
+                float out[d_seq][4 * d_model];
+            } gelu;
+            struct {
+                float out[d_seq][d_model];
+            } c_proj;
+        } mlp;
+        struct {
+            float out[d_seq][d_model];
+        } res_2;
     } h[12];
+    struct {
+        float out[d_seq][d_model];
+    } ln_f;
+    struct {
+        float out[d_seq][d_vocab];
+    } unembedding;
+    struct {
+        float out[d_seq][d_vocab];
+    } prob;
 };
+
+struct grads{
+    struct {
+        float weight[d_model];
+        float bias[d_model];
+        
+    } ln_f;
+    struct {
+        float weight[d_vocab][d_model];
+    } wte;
+};
+
+struct activations_back {
+    struct {
+        float out[d_seq][d_model];
+    } ln_f;
+    struct {
+        float out[d_seq][d_vocab];
+    } unembedding;
+
+};
+
+struct linear {
+    const float* in;
+    const float* weights;
+    const float* bias;
+    float* out;
+    size_t in_size;
+    size_t out_size;
+    size_t sample_size; 
+};
+
+struct ln {
+    const float* in;
+    const float* weight;
+    const float* bias;
+    float* out;
+    size_t in_size; // # elements per row
+    size_t sample_size;
+};
+
+static void layer_norm(const struct ln* ln) {
+    
+    for (size_t i = 0; i < ln->sample_size; i++) {
+        const float* in = ln->in + i * ln->in_size;
+        const float* in_end = in + ln->in_size;
+        const float* in_reset = in;
+
+        float mean = 0.0f;
+        for (; in != in_end; in++) {
+            mean += *in;
+            }
+        mean /= ln->in_size;
+
+        float SSD = 0.0f;
+        for (in = in_reset; in != in_end; in++) {
+            float diff = *in - mean;
+            SSD += diff * diff;
+        }
+
+        float inv_std = 1.0f / sqrt(SSD / ln->in_size);
+
+        const float* weight = ln->weight;
+        const float* bias = ln->bias;
+        float* out = ln->out + i * ln->in_size;
+        // normalize
+        for (in = in_reset; in != in_end; in++, weight++, bias++, out++) {
+            float in_norm = (*in - mean) * inv_std;
+            *out = in_norm * *weight + *bias;
+        }
+    }
+}
+
+
+
+static void linear(const struct linear* lin) {
+    for (size_t i = 0; i < lin->sample_size; i++) {
+        const float* in = lin->in + i * lin->in_size;
+        const float* weight = lin->weights;
+        const float* weight_end = weight + lin->in_size * lin->out_size;
+        const float* bias = lin->bias;
+
+        float* out = lin->out + i * lin->out_size;
+        float* out_end = out + lin->out_size;
+        float* out_reset = out;
+
+        memcpy(out, bias, lin->out_size * sizeof(float));
+
+        while (true) {
+            *out += *weight * *in;
+            weight++;
+            out++;
+            if (out == out_end) {
+                out = out_reset;
+                in++;
+                if (weight == weight_end) {
+                    break;
+                }
+            }
+        }
+    }
+}
+
 
 static size_t tensor_2_offset(char* json_raw, char* tensor_name, size_t expec_size) {
     // maybe end_offset is not needed
@@ -124,6 +275,10 @@ int main() {
     offset += align(sizeof(struct params));
     size_t activations_offset = offset;
     offset += align(sizeof(struct activations));
+    size_t grads_offset = offset;
+    offset += align(sizeof(struct grads));
+    size_t activations_back_offset = offset;
+    offset += align(sizeof(struct activations_back));
 #undef align
     char* raw_mem = malloc(offset);
     struct decoder* decoder = (struct decoder*)(raw_mem + decoder_offset);
@@ -132,9 +287,8 @@ int main() {
     float* params_raw = (float*)(raw_mem + params_raw_offset);
     struct params* params = (struct params*)(raw_mem + params_offset);
     struct activations* activations = (struct activations*)(raw_mem + activations_offset);
-    {
-        /* data */
-    };
+    struct grads* grads = (struct grads*)(raw_mem + grads_offset);
+    struct activations_back* activations_back = (struct activations_back*)(raw_mem + activations_back_offset);
     
 
     {
@@ -148,7 +302,7 @@ int main() {
     //     printf("offset %u, size %u, %.*s\n", o, l, l, decoder->raw + o );
     // }
     fclose(pf);
-    printf("test\n");
+    
     }
 
     {
@@ -197,9 +351,8 @@ int main() {
             // here check if first layer then ln_1_in = embd_out else ln_1_in = res_2_out (see python)
 
             // handle ln_1 weights and bias for each 12 layers
-            printf("layer_i: %u\n", layer_i);
+            
             sprintf(temp_name, "h.%u.ln_1.weight", layer_i);
-            printf("temp_name: %s\n", temp_name);
             params->h[layer_i].ln_1.weight = params_raw + tensor_2_offset(json_raw, temp_name, d_model);
 
             sprintf(temp_name, "h.%u.ln_1.bias", layer_i);
@@ -279,6 +432,7 @@ int main() {
     }
     size_t inp_size = 64;
     uint16_t* inp = data->tokens;
+    uint16_t* expected = data->tokens + 1;
 
     for (size_t i = 0; i < inp_size; i++) {
         uint16_t token = inp[i];
@@ -295,48 +449,370 @@ int main() {
         }
 
     }
+    // double sum = 0.0;
+    // for (size_t i = 0; i < inp_size * d_model; i++) {
+    //     sum += (double)((float*)activations->embedding.out)[i];
+    // }
+    // printf("sum: %f\n", sum);
+
+   
+    for (int layer_idx = 0; layer_idx < n_layers; layer_idx++) {
+
+        float* layer_in = layer_idx == 0 ? (float*)activations->embedding.out : (float*)activations->h[layer_idx - 1].res_2.out;
+
+        // here insert layer norm 1
+
+        layer_norm(&(struct ln){
+            .in = layer_in,
+            .weight = params->h[layer_idx].ln_1.weight,
+            .bias = params->h[layer_idx].ln_1.bias,
+            .out = (float*)activations->h[layer_idx].ln_1.out,
+            .in_size = d_model,
+            .sample_size = inp_size
+        });
+
+        // linear transformation
+
+        linear(&(struct linear){
+            .in = (float*)activations->h[layer_idx].ln_1.out,
+            .weights = params->h[layer_idx].attn.c_attn.weight,
+            .bias = params->h[layer_idx].attn.c_attn.bias,
+            .out = (float*)activations->h[layer_idx].attn.c_attn.out,
+            .in_size = d_model,
+            .out_size = 3 * d_model,
+            .sample_size = inp_size
+        });
+
+        // multihead attention
+
+        memset(activations->h[layer_idx].attn.z.out, 0, sizeof(activations->h[layer_idx].attn.z.out[0]));
+
+        for (size_t head_i = 0; head_i < 12; head_i++) {
+            for (size_t q_i = 0; q_i < inp_size; q_i++) {
+
+                float softmax_max = -INFINITY;
+                
+                for (size_t k_i = 0; k_i <= q_i; k_i++) {
+                    // first block of the matrix are the q vectors point to d_model
+                    float* q = (float*)activations->h[layer_idx].attn.c_attn.out + q_i * 3 * d_model + head_i * d_k;
+                    float* q_end = q + d_k;
+                    // second block of the matrix are the k vectors point to d_model
+                    float* k = (float*)activations->h[layer_idx].attn.c_attn.out + k_i * 3 * d_model + d_model + head_i * d_k; // acess block of k vectors for each head
+                    
+                    
+                    float dot  = 0.0f;
+                    for (; q != q_end; q++, k++) {
+                        dot += *q * *k;  
+                    }
+                    
+                    dot *= inv_sqrt_k;
+                    activations->h[layer_idx].attn.attn.out[head_i][q_i][k_i] = dot;
+
+                    if (dot > softmax_max) {
+                        softmax_max = dot;
+                    }
+                }
+                
+                float softmax_sum = 0.0f;
+
+                for (size_t k_i = 0; k_i <= q_i; k_i++){
+                    float e = activations->h[layer_idx].attn.attn.out[head_i][q_i][k_i];
+
+                    float softmax_exp_i = expf(e - softmax_max);
+                    activations->h[layer_idx].attn.s.out[head_i][q_i][k_i] = softmax_exp_i;
+
+                    softmax_sum += softmax_exp_i;
+
+                }
+
+                float inv_softmax_sum = 1.0f / softmax_sum;
+
+                for (size_t k_i = 0; k_i <= q_i; k_i++) {
+                    activations->h[layer_idx].attn.s.out[head_i][q_i][k_i] *= inv_softmax_sum;
+                }
+
+                for (size_t v_i = 0; v_i <= q_i; v_i++) {
+                    // last block of the matrix are the v vectors point to 2 * d_model
+                    float* v = (float*)activations->h[layer_idx].attn.c_attn.out + v_i * 3 * d_model + 2 * d_model + head_i * d_k; // access block of v vectors for each head
+                    float* z = (float*)activations->h[layer_idx].attn.z.out + q_i * d_model + head_i * d_k;
+                    float* v_end = v + d_k;
+                    
+                    float fctr = activations->h[layer_idx].attn.s.out[head_i][q_i][v_i];
+
+                    for (; v != v_end; v++, z++) {
+                        *z += *v * fctr;
+                    }
+                }
+            }      
+        }
+        
+        linear(&(struct linear){
+            .in = (float*)activations->h[layer_idx].attn.z.out,
+            .weights = params->h[layer_idx].attn.c_proj.weight,
+            .bias = params->h[layer_idx].attn.c_proj.bias,
+            .out = (float*)activations->h[layer_idx].attn.c_proj.out,
+            .in_size = d_model,
+            .out_size = d_model,
+            .sample_size = inp_size
+        });
+
+        // residual connection
+        const float* in_1 = layer_in;
+        const float* in_2 = (float*)activations->h[layer_idx].attn.c_proj.out;
+
+        float* out = (float*)activations->h[layer_idx].res_1.out;
+
+        float* out_end = out + inp_size * d_model;
+
+        for (; out != out_end; out++, in_1++, in_2++) {
+            *out = *in_1 + *in_2;
+        }
+
+        layer_norm(&(struct ln){
+            .in = (float*)activations->h[layer_idx].res_1.out,
+            .weight = params->h[layer_idx].ln_2.weight,
+            .bias = params->h[layer_idx].ln_2.bias,
+            .out = (float*)activations->h[layer_idx].ln_2.out,
+            .in_size = d_model,
+            .sample_size = inp_size
+        });
+
+        // mlp c_fc linear transformation
+
+        linear(&(struct linear){
+            .in = (float*)activations->h[layer_idx].ln_2.out,
+            .weights = params->h[layer_idx].mlp.c_fc.weight,
+            .bias = params->h[layer_idx].mlp.c_fc.bias,
+            .out = (float*)activations->h[layer_idx].mlp.c_fc.out,
+            .in_size = d_model,
+            .out_size = 4 * d_model,
+            .sample_size = inp_size
+        });
+
+        // gelu activation
+
+        for (size_t i = 0; i < inp_size; i++) {
+            float* in = (float*)activations->h[layer_idx].mlp.c_fc.out + i * 4 * d_model; // access the rows of the matrix
+            float* out = (float*)activations->h[layer_idx].mlp.gelu.out + i * 4 * d_model;
+            float* out_end = out + inp_size * 4 * d_model;
+
+            for (; out != out_end; out++, in++) {
+                float cdf = 0.5 * (1.0 + erff(*in * (float)M_SQRT1_2));
+                *out = *in * cdf;
+            }
+        }
+    
+
+    // mlp c_proj linear transformation
+
+        linear(&(struct linear){
+            .in = (float*)activations->h[layer_idx].mlp.gelu.out,
+            .weights = params->h[layer_idx].mlp.c_proj.weight,
+            .bias = params->h[layer_idx].mlp.c_proj.bias,
+            .out = (float*)activations->h[layer_idx].mlp.c_proj.out,
+            .in_size = 4 * d_model,
+            .out_size = d_model,
+            .sample_size = inp_size
+        });
+
+        {
+            const float* in_1 = (float*)activations->h[layer_idx].res_1.out;
+            const float* in_2 = (float*)activations->h[layer_idx].mlp.c_proj.out;
+
+            float* out = (float*)activations->h[layer_idx].res_2.out;
+
+            float* out_end = out + inp_size * d_model;
+
+            for (; out != out_end; out++, in_1++, in_2++) {
+                *out = *in_1 + *in_2;
+            }
+        }
+    }
+
+    layer_norm(&(struct ln){
+        .in = (float*)activations->h[11].res_2.out,
+        .weight = params->ln_f.weight,
+        .bias = params->ln_f.bias,
+        .out = (float*)activations->ln_f.out,
+        .in_size = d_model,
+        .sample_size = inp_size
+    });
+
+    // unembedding
+
+    for (size_t i = 0; i < inp_size; i++) {
+        const float* in = (float*)activations->ln_f.out + i * d_model;
+        const float* in_end = in + d_model;
+        const float* in_reset = in;
+
+        const float* weight = params->wte.weight;
+        const float* weight_end = weight + d_vocab * d_model;
+
+        float* out = (float*)activations->unembedding.out + i * d_vocab;
+
+        float dot = 0.0f;
+
+        while (true){
+            dot += *in * *weight;
+            in++;
+            weight++;
+            if (in == in_end) {
+                in = in_reset;
+                *out = dot;
+                dot = 0.0f;
+                out++;
+                if (weight == weight_end) {
+                    break;
+                }
+            }
+        }
+    }
+
+    for (size_t i = 0; i < inp_size; i++) {
+        const float* in = (float*)activations->unembedding.out + i * d_vocab;
+        const float* in_end = in + d_vocab;
+        const float* in_reset = in;
+
+        float softmax_max = -INFINITY;
+        for (; in != in_end; in++) {
+            if (*in > softmax_max) {
+                softmax_max = *in;
+            }
+        }
+
+        float softmax_sum = 0.0f;
+
+        float* out = (float*)activations->prob.out + i * d_vocab;
+        float* out_end = out + d_vocab;
+        float* out_reset = out;
+
+        for (in = in_reset; in != in_end; in++, out++) {
+            float e = expf(*in - softmax_max);
+            *out = e;
+            softmax_sum += e;
+        }
+        float inv_softmax_sum = 1.0f / softmax_sum;
+        
+        for (out = out_reset; out != out_end; out++) {
+            *out *= inv_softmax_sum;
+        }
+
+    }
+
+    float loss = 0.0f;
+    for (size_t i = 0; i < inp_size; i++) {
+        uint16_t token = expected[i];
+        float ce = -logf(activations->prob.out[i][token]);
+        loss += ce; 
+    }
+
+    // avergae loss
+    loss /= (float)inp_size;
+    printf("loss: %f\n", loss);
+
+    memset(activations_back, 0, sizeof(struct activations_back));
+    memset(grads, 0, sizeof(struct grads));
+
+    // backwards pass for cross entropy loss
+
+    memcpy(activations_back->unembedding.out, activations->prob.out, inp_size * d_vocab * sizeof(float));
+
+    for (size_t i = 0; i < inp_size; i++) {
+        uint16_t token = expected[i];
+        activations_back->unembedding.out[i][token] -= 1.0f;
+    }
+
+    // backwards pass for unembedding
+
+
+    float inv_inp_size = 1.0f / (float)inp_size;
+    
+    // gradients with respect to the input
+    for (size_t i = 0; i < inp_size; i++) {
+        const float* in = (float*)activations->ln_f.out + i * d_model;
+        float* dl_din = (float*)activations_back->ln_f.out + i * d_model;
+        float* dl_din_end = dl_din + d_model;
+        float* dl_din_reset = dl_din;
+
+        const float* weight = params->wte.weight;
+        const float* weight_end = weight + d_vocab * d_model;
+        float* dl_dweight = (float*)grads->wte.weight;
+
+        const float* dl_dout = (float*)activations_back->unembedding.out + i * d_vocab;
+        
+        while (true){
+            *dl_din += *dl_dout * *weight;
+            *dl_dweight += *dl_dout * *in * inv_inp_size;
+            in++;
+            dl_din++;
+            weight++;
+            dl_dweight++;
+            if (dl_din == dl_din_end) {
+                dl_din = dl_din_reset;
+                dl_dout++;
+                if (weight == weight_end) {
+                    break;
+                }
+            }
+        }
+        for (dl_din = dl_din_reset; dl_din != dl_din_end; dl_din++) {
+            *dl_din *= 1.0f * inv_inp_size;
+        }
+
+    }
+
+    for (size_t i = 0; i < inp_size; i++) {
+        float* dl_dout = (float*)activations_back->ln_f.out + i * d_model;
+        float* dl_dout_end = dl_dout + d_model;
+        float* dl_dbias = (float*)grads->ln_f.bias;
+
+        for (; dl_dout != dl_dout_end; dl_dout++, dl_dbias++) {
+            *dl_dbias += *dl_dout;
+        }
+    }
+
     double sum = 0.0;
     for (size_t i = 0; i < inp_size * d_model; i++) {
-    sum += (double)((float*)activations->embedding.out)[i];
-    }
+        sum += (double)((float*)activations_back->ln_f.out)[i];
+    }  
+
     printf("sum: %f\n", sum);
 
-    int layer_idx = 0;
 
-    for (size_t i = 0; i < inp_size + d_model; i++) {
-        float* in = (float*)activations->embedding.out + i * d_model;
-        float* in_end = in + d_model;
-        float* in_reset = in;
 
-        float mean = 0.0f;
-        for (; in != in_end; in++) {
-            mean += *in;
-            }
-        mean /= d_model;
+    // float max_v = -INFINITY;
+    // size_t max_idx = 0;
+    // float* row = (float*)activations->unembedding.out + (inp_size - 1) * d_vocab;
 
-        float SSD = 0.0f;
-        for (in = in_reset; in != in_end; in++) {
-            float diff = *in - mean;
-            SSD += diff * diff;
-        }
+    // // argmax
+    // for (size_t s = 0; s < d_vocab; s++) {
+    //     if (row[s] > max_v) {
+    //         max_v = row[s];
+    //         max_idx = s;
+    //     }
+    // }
 
-        float inv_std = 1.0f / sqrt(SSD / d_model);
+    // for (size_t i = 0; i < inp_size; i++) {
+    //     uint16_t token = inp[i];
+    //     printf("%.*s", decoder->tokens[token].length, decoder->raw + decoder->tokens[token].offset);
+    // }
+    // printf("\n");
+    // printf("%.*s\n", decoder->tokens[max_idx].length, decoder->raw + decoder->tokens[max_idx].offset);
 
-        float* out = (float*)activations->h[layer_idx].ln_1.out + i * d_model;
-        float* weight = params->h[layer_idx].ln_1.weight;
-        float* bias = params->h[layer_idx].ln_1.bias;
-        // normalize
-        for (in = in_reset; in != in_end; in++, weight++, bias++, out++) {
-            float in_norm = (*in - mean) * inv_std;
-            *out = in_norm * *weight + *bias;
-        }
-    }
-    double sum = 0.0;
-    for (size_t i = 0; i < inp_size * d_model; i++) {
-        sum += (double)((float*)activations->h[layer_idx].out)[i];
-    }   
+    // printf("max_idx: %zu\n", max_idx);
 
-    
+    // cross entropy loss one hot vector for target ce(x) = -log(softmax(x)[target])
+
+    // step 1 compute softmax
+
+
+
+    // double sum = 0.0;
+    // for (size_t i = 0; i < inp_size * d_vocab; i++) {
+    //     sum += (double)((float*)activations->unembedding.out)[i];
+    // }  
+
+    // printf("sum: %f\n", sum);
     return 0;
 }
 

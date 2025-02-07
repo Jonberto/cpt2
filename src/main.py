@@ -5,6 +5,7 @@ import torch
 from torch.nn import functional as F
 
 
+
 encd = tk.encoding_for_model('gpt2') # gets the encoding scheme for gpt2 wieghts depend on this encoding
 f = open('data/tiny.txt', 'r')
 tokens = encd.encode(f.read()) # encodes the text
@@ -25,13 +26,13 @@ for ft in fts:
     name = ft[0]
     data = ft[1]['data']
     shape = ft[1]['shape']
-    params[name] = torch.frombuffer(data, dtype=torch.float32).reshape(shape)
+    params[name] = torch.frombuffer(data, dtype=torch.float32, requires_grad=True).reshape(shape)
+    params[name].retain_grad()
 
 wte_out = F.embedding(x, params["wte.weight"])
 wpe_out = F.embedding(torch.arange(len(x)),params["wpe.weight"])
 embd_out = wte_out + wpe_out # tensor(-30.5272)
-print(embd_out.sum())
-exit(0)
+
 
 for layer_i in range(12):
     ln_1_in = embd_out if layer_i == 0 else res_2_out
@@ -53,7 +54,7 @@ for layer_i in range(12):
 
     q, k, v = attn_c_attn_out.split(dim_model, dim=1)
     attn_z_out = torch.zeros_like(ln_1_out)
-    for head_i in range(1):
+    for head_i in range(12):
         a = q[:, head_i*dim_k:(head_i+1)*dim_k] @ k[:, head_i*dim_k:(head_i+1)*dim_k].transpose(0, 1)
         a /= torch.sqrt(torch.tensor(dim_k, dtype=torch.float32))
         mask = torch.triu(torch.ones_like(a, dtype=bool), diagonal=1) # lower triangular mask
@@ -62,12 +63,14 @@ for layer_i in range(12):
         z = s @ v[:, head_i*dim_k:(head_i+1)*dim_k]
         attn_z_out[:, head_i*dim_k:(head_i+1)*dim_k] = z                                                                      
 
+    
     attn_c_proj_out = F.linear(
         input=attn_z_out, 
         weight=params[f"h.{layer_i}.attn.c_proj.weight"].transpose(0, 1), 
         bias=params[f"h.{layer_i}.attn.c_proj.bias"])
-
-
+    # print(params[f"h.{layer_i}.attn.c_proj.weight"].transpose(0, 1).shape)
+    # print(attn_c_proj_out.shape)
+    # exit(0)
     # Residual connection
     res_1_out = ln_1_in + attn_c_proj_out
    
@@ -116,5 +119,23 @@ print(encd.decode(list(x)))
 print(encd.decode([token_idx]))
 
 #print cross entropy loss for the last token
+print(unembdd_out.shape, y_target.shape)
+target_tokens = encd.decode(y_target.tolist())
+print(target_tokens)
+
+#step 1 softmax
+#step 2 log of the softmax
+#step 3 #multiply the log of the softmax with the target token
+# step4 negative of the result
+# step5 mean of the result
+# step6 return the result
+
 ce_loss = F.cross_entropy(unembdd_out, y_target)
-print(ce_loss)
+print('loss', ce_loss)
+
+unembdd_out.retain_grad()
+   
+loss = ce_loss
+loss.backward()
+
+print(unembdd_out.grad.shape)
