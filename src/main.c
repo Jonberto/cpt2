@@ -90,6 +90,8 @@ struct activations {
     } embedding;
     struct {
         struct{
+            float mean[d_seq];
+            float inv_std[d_seq];
             float out[d_seq][d_model];
         } ln_1;
         struct {
@@ -113,6 +115,8 @@ struct activations {
             float out[d_seq][d_model];
         } res_1;
         struct {
+            float mean[d_seq];
+            float inv_std[d_seq];
             float out[d_seq][d_model];
         } ln_2;
         struct {
@@ -131,6 +135,8 @@ struct activations {
         } res_2;
     } h[12];
     struct {
+        float mean[d_seq];
+        float inv_std[d_seq];
         float out[d_seq][d_model];
     } ln_f;
     struct {
@@ -143,9 +149,21 @@ struct activations {
 
 struct grads{
     struct {
+        struct {
+            struct {
+                float weight[d_model][4 * d_model];
+                float bias[4 * d_model];
+            } c_fc;
+            struct {
+                float weight[4 * d_model][d_model];
+                float bias[d_model];
+            } c_proj;                   
+        } mlp;
+    } h[12];
+
+    struct {
         float weight[d_model];
         float bias[d_model];
-        
     } ln_f;
     struct {
         float weight[d_vocab][d_model];
@@ -153,6 +171,19 @@ struct grads{
 };
 
 struct activations_back {
+    struct {
+        struct{
+            struct {
+                float out[d_seq][4 * d_model];
+            } c_fc;
+            struct {
+                float out[d_seq][4 * d_model];
+            } gelu;
+        } mlp;
+        struct {
+            float out[d_seq][d_model];
+        } res_2;
+    } h[12];
     struct {
         float out[d_seq][d_model];
     } ln_f;
@@ -176,13 +207,40 @@ struct ln {
     const float* in;
     const float* weight;
     const float* bias;
+    float* inv_std;
+    float* mean;
     float* out;
     size_t in_size; // # elements per row
     size_t sample_size;
 };
 
+struct ln_back {
+    const float* in;
+    const float* weight;
+    const float* bias;
+    const float* dl_dout;
+    float* inv_std;
+    float* mean;
+    float* dl_din;
+    float* dl_dweight;
+    float* dl_dbias;
+    size_t in_size; // # elements per row
+    size_t sample_size;
+};
+
+struct linear_back {
+    const float* in;
+    const float* weight;
+    const float* bias;
+    const float* dl_dout;
+    float* dl_dweight;
+    float* dl_dbias;
+    size_t in_size;
+    size_t out_size;
+    size_t sample_size;
+};
+
 static void layer_norm(const struct ln* ln) {
-    
     for (size_t i = 0; i < ln->sample_size; i++) {
         const float* in = ln->in + i * ln->in_size;
         const float* in_end = in + ln->in_size;
@@ -193,6 +251,7 @@ static void layer_norm(const struct ln* ln) {
             mean += *in;
             }
         mean /= ln->in_size;
+        ln->mean[i] = mean;
 
         float SSD = 0.0f;
         for (in = in_reset; in != in_end; in++) {
@@ -200,7 +259,8 @@ static void layer_norm(const struct ln* ln) {
             SSD += diff * diff;
         }
 
-        float inv_std = 1.0f / sqrt(SSD / ln->in_size);
+        float inv_std = 1.0f / sqrtf(SSD / ln->in_size);
+        ln->inv_std[i] = inv_std;
 
         const float* weight = ln->weight;
         const float* bias = ln->bias;
@@ -215,10 +275,10 @@ static void layer_norm(const struct ln* ln) {
 
 
 
-static void linear(const struct linear* lin) {
+static void linear(const struct linear_back* lin) {
     for (size_t i = 0; i < lin->sample_size; i++) {
         const float* in = lin->in + i * lin->in_size;
-        const float* weight = lin->weights;
+        const float* weight = lin->weight;
         const float* weight_end = weight + lin->in_size * lin->out_size;
         const float* bias = lin->bias;
 
@@ -236,6 +296,90 @@ static void linear(const struct linear* lin) {
                 out = out_reset;
                 in++;
                 if (weight == weight_end) {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+static void layer_norm_back (const struct ln_back* ln) {
+    for (size_t i = 0; i < ln->sample_size; i++) {
+        float* dl_din = ln->dl_din + i * ln->in_size;
+        const float* in = ln->in + i * ln->in_size;
+        const float* in_reset = in;
+        
+        const float* dl_dout = ln->dl_dout + i * ln->in_size;
+        const float* dl_dout_end = dl_dout + ln->in_size;
+        const float* dl_dout_reset = dl_dout;
+
+        float* dl_dbias = ln->dl_dbias;
+        float* dl_dweight = ln->dl_dweight;
+        const float* weight = ln->weight;
+        const float* weight_reset = weight;
+
+        float mean = ln->mean[i];
+        float inv_std = ln->inv_std[i];
+
+        float mean_partial = 0.0f;
+        float std_partial = 0.0f;
+
+        for (; dl_dout != dl_dout_end; dl_dout++, dl_dbias++, dl_dweight++, weight++, in++) {
+            float dl_din_norm = *dl_dout * *weight; // dL/din_norm
+            float in_norm = (*in - mean) * inv_std; // in_norm
+            *dl_dbias += *dl_dout;
+            *dl_dweight += *dl_dout * in_norm;
+
+            mean_partial += dl_din_norm;
+            std_partial += dl_din_norm * in_norm;
+        }
+
+        mean_partial /= (float)ln->in_size;
+        std_partial /= (float)ln->in_size;
+
+        dl_dout = dl_dout_reset;
+        in = in_reset;
+        weight = weight_reset;
+
+        for (; dl_dout != dl_dout_end; dl_dout++, in++, dl_din++, weight++) {
+            float dl_din_norm = *dl_dout * *weight;
+            float in_norm = (*in - mean) * inv_std;
+
+            float dl_din_ = 0.0f;
+            dl_din_ += dl_din_norm;
+            dl_din_ -= mean_partial;
+            dl_din_ -= std_partial * in_norm;
+            dl_din_ *= inv_std;
+            *dl_din = dl_din_;
+        }
+    }
+}
+
+static void linear_back(const struct linear* lin) {
+    for (size_t i = 0; i < lin->in_size; i++){
+        float* dl_dweight = lin->weight;
+        float* dl_dweight_end = dl_dweight + 4 * d_model * d_model;
+        float* dl_dbias = (float*)grads->h[11].mlp.c_proj.bias;
+        const float* dl_dout = (float*)activations_back->h[11].res_2.out + i * d_model;
+        const float* dl_dout_end = dl_dout + d_model;
+        const float* dl_dout_reset = dl_dout;
+
+        const float* in = (float*)activations->h[11].mlp.gelu.out + i * 4 * d_model;
+
+        for (; dl_dout != dl_dout_end; dl_dout++, dl_dbias++) { //  dl_dweight++,
+            *dl_dbias += *dl_dout;
+        }
+
+        dl_dout = dl_dout_reset;
+
+        while (true) {
+            *dl_dweight += *in * *dl_dout;
+            dl_dout++;
+            dl_dweight++;
+            if (dl_dout == dl_dout_end) {
+                dl_dout = dl_dout_reset;
+                in++;
+                if (dl_dweight == dl_dweight_end) {
                     break;
                 }
             }
@@ -289,6 +433,7 @@ int main() {
     struct activations* activations = (struct activations*)(raw_mem + activations_offset);
     struct grads* grads = (struct grads*)(raw_mem + grads_offset);
     struct activations_back* activations_back = (struct activations_back*)(raw_mem + activations_back_offset);
+
     
 
     {
@@ -467,6 +612,8 @@ int main() {
             .weight = params->h[layer_idx].ln_1.weight,
             .bias = params->h[layer_idx].ln_1.bias,
             .out = (float*)activations->h[layer_idx].ln_1.out,
+            .inv_std = (float*)activations->h[layer_idx].ln_1.inv_std,
+            .mean = (float*)activations->h[layer_idx].ln_1.mean,
             .in_size = d_model,
             .sample_size = inp_size
         });
@@ -573,6 +720,8 @@ int main() {
             .weight = params->h[layer_idx].ln_2.weight,
             .bias = params->h[layer_idx].ln_2.bias,
             .out = (float*)activations->h[layer_idx].ln_2.out,
+            .mean = (float*)activations->h[layer_idx].ln_2.mean,
+            .inv_std = (float*)activations->h[layer_idx].ln_2.inv_std,
             .in_size = d_model,
             .sample_size = inp_size
         });
@@ -597,7 +746,7 @@ int main() {
             float* out_end = out + inp_size * 4 * d_model;
 
             for (; out != out_end; out++, in++) {
-                float cdf = 0.5 * (1.0 + erff(*in * (float)M_SQRT1_2));
+                float cdf = 0.5 * (1.0 + erff(*in * (float)M_SQRT1_2)); // M_SQRT1_2 def in math.h
                 *out = *in * cdf;
             }
         }
@@ -634,6 +783,8 @@ int main() {
         .weight = params->ln_f.weight,
         .bias = params->ln_f.bias,
         .out = (float*)activations->ln_f.out,
+        .mean = activations->ln_f.mean,
+        .inv_std = activations->ln_f.inv_std,
         .in_size = d_model,
         .sample_size = inp_size
     });
@@ -758,25 +909,122 @@ int main() {
         for (dl_din = dl_din_reset; dl_din != dl_din_end; dl_din++) {
             *dl_din *= 1.0f * inv_inp_size;
         }
-
     }
 
-    for (size_t i = 0; i < inp_size; i++) {
-        float* dl_dout = (float*)activations_back->ln_f.out + i * d_model;
-        float* dl_dout_end = dl_dout + d_model;
-        float* dl_dbias = (float*)grads->ln_f.bias;
+    // backwards pass for layer norm f
+    // for (size_t i = 0; i < inp_size; i++) {
+    //     float* dl_din = (float*)activations_back->h[11].res_2.out + i * d_model;
+    //     const float* in = (float*)activations->h[11].res_2.out + i * d_model;
+    //     const float* in_reset = in;
+        
 
-        for (; dl_dout != dl_dout_end; dl_dout++, dl_dbias++) {
-            *dl_dbias += *dl_dout;
-        }
-    }
+    //     float* dl_dout = (float*)activations_back->ln_f.out + i * d_model;
+    //     float* dl_dout_end = dl_dout + d_model;
+    //     float* dl_dout_reset = dl_dout;
+
+    //     float* dl_dbias = (float*)grads->ln_f.bias;
+    //     float* dl_dweight = (float*)grads->ln_f.weight;
+    //     const float* weight = params->ln_f.weight;
+    //     const float* weight_reset = weight;
+
+    //     float mean = activations->ln_f.mean[i];
+    //     float inv_std = activations->ln_f.inv_std[i];
+
+    //     float mean_partial = 0.0f;
+    //     float std_partial = 0.0f;
+
+    //     for (; dl_dout != dl_dout_end; dl_dout++, dl_dbias++, dl_dweight++, weight++, in++) {
+    //         float dl_din_norm = *dl_dout * *weight; // dL/din_norm
+    //         float in_norm = (*in - mean) * inv_std; // in_norm
+    //         *dl_dbias += *dl_dout;
+    //         *dl_dweight += *dl_dout * in_norm;
+
+            
+    //         mean_partial += dl_din_norm;
+    //         std_partial += dl_din_norm * in_norm;
+
+    //     }
+
+    //     mean_partial /= (float)d_model;
+    //     std_partial /= (float)d_model;
+
+    //     dl_dout = dl_dout_reset;
+    //     in = in_reset;
+    //     weight = weight_reset;
+
+    //     for (; dl_dout != dl_dout_end; dl_dout++, in++, dl_din++, weight++) {
+    //         float dl_din_norm = *dl_dout * *weight;
+    //         float in_norm = (*in - mean) * inv_std;
+
+    //         float dl_din_ = 0.0f;
+    //         dl_din_ += dl_din_norm;
+    //         dl_din_ -= mean_partial;
+    //         dl_din_ -= std_partial * in_norm;
+    //         dl_din_ *= inv_std;
+    //         *dl_din = dl_din_;
+
+
+    //     }
+
+    // }
+
+    layer_norm_back(&(struct ln_back){
+        .in = (float*)activations->h[11].res_2.out,
+        .weight = params->ln_f.weight,
+        .bias = params->ln_f.bias,
+        .dl_dout = (float*)activations_back->ln_f.out,
+        .inv_std = activations->ln_f.inv_std,
+        .mean = activations->ln_f.mean,
+        .dl_din = (float*)activations_back->h[11].res_2.out,
+        .dl_dweight = (float*)grads->ln_f.weight,
+        .dl_dbias = (float*)grads->ln_f.bias,
+        .in_size = d_model,
+        .sample_size = inp_size
+    });
+
+
+    // backwards pass for the 12 layers
+
+    // for (size_t i = 0; i < inp_size; i++){
+    //     float* dl_dweight = (float*)grads->h[11].mlp.c_proj.weight;
+    //     float* dl_dweight_end = dl_dweight + 4 * d_model * d_model;
+    //     float* dl_dbias = (float*)grads->h[11].mlp.c_proj.bias;
+    //     const float* dl_dout = (float*)activations_back->h[11].res_2.out + i * d_model;
+    //     const float* dl_dout_end = dl_dout + d_model;
+    //     const float* dl_dout_reset = dl_dout;
+
+    //     const float* in = (float*)activations->h[11].mlp.gelu.out + i * 4 * d_model;
+    //     float* dl_din = (float*)activations_back->h[11].mlp.gelu.out + i * 4 * d_model;
+
+    //     for (; dl_dout != dl_dout_end; dl_dout++, dl_dbias++) { //  dl_dweight++,
+    //         *dl_dbias += *dl_dout;
+    //     }
+
+    //     dl_dout = dl_dout_reset;
+
+    //     while (true) {
+    //         *dl_dweight += *in * *dl_dout;
+    //         dl_dout++;
+    //         dl_dweight++;
+    //         if (dl_dout == dl_dout_end) {
+    //             dl_dout = dl_dout_reset;
+    //             in++;
+    //             if (dl_dweight == dl_dweight_end) {
+    //                 break;
+    //             }
+    //         }
+    //     }
+    // }
+
+
+
 
     double sum = 0.0;
-    for (size_t i = 0; i < inp_size * d_model; i++) {
-        sum += (double)((float*)activations_back->ln_f.out)[i];
+    for (size_t i = 0; i < 4 * d_model * d_model; i++) {
+        sum += (double)fabsf(((float*)grads->h[11].mlp.c_proj.weight)[i]);
     }  
 
-    printf("sum: %f\n", sum);
+    printf("sum: %.16f\n", sum);
 
 
 
