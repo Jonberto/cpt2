@@ -1,5 +1,2 @@
 # gpt 2 
-so far forward pass is implemented and backwards not fully
-run the build script
-
-reference implementation is done in the python file in src/
+This project is a light implementation of the GPT 2 architecture in C. Aim is to load and run inference using pre trained weights exported from Hugging Face in the safetensor. The model uses 12 transformer layers, a hidden size of 768, and a sequence length of 1024. The code handles tokenizer decoding, input token loading, and memory efficient allocation of all parameters and activations. The forward pass  linear layers and layer normalization are implemented manually, with partial support for backpropagation (some passes like for fully connected layers and layer normalization are implemented). But the full complete pass remains unfinished.
