@@ -1,7 +1,4 @@
 # gpt 2 
 This project is a light implementation of the GPT 2 architecture in C. Aim with this project was to understand modern NLP archistectures while thinking about memory and compute constraints but still optimizing for performance. The model uses 12 transformer layers, a hidden size of 768, and a sequence length of 1024. The code handles tokenizer decoding, input token loading, and memory efficient allocation of all parameters and activations. The forward pass  linear layers and layer normalization are implemented manually, with partial support for backpropagation (some passes like for fully connected layers and layer normalization are implemented). But the full complete pass remains unfinished.
 
-This project is a minimal, pure-C implementation of GPT-2, built to explore efficient inference without external dependencies. It demonstrates a deep understanding of modern NLP architectures while pushing performance within tight memory and compute constraints
-
-
 To run download the model weights from this link https://huggingface.co/openai-community/gpt2/resolve/main/model.safetensors and place in the data folder 
